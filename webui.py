@@ -185,6 +185,63 @@ def generate_single_audio(prompt_audio, text):
         traceback.print_exc()
         return None
 
+def continue_to_next_audio(current_audio_out, *all_audio_components):
+    """当前音频播放结束后，自动播放下一条音频"""
+    try:
+        print("开始处理自动播放...")
+        print(f"当前音频数据: {current_audio_out}")
+        print(f"所有音频组件数量: {len(all_audio_components)}")
+        
+        # 找到当前音频组件的索引
+        current_idx = -1
+        for i, comp in enumerate(all_audio_components):
+            if comp is not None and isinstance(comp, tuple) and len(comp) == 2:
+                # 比较采样率和数组是否相同
+                if (comp[0] == current_audio_out[0] and 
+                    np.array_equal(comp[1], current_audio_out[1])):
+                    current_idx = i
+                    break
+        
+        print(f"找到当前音频索引: {current_idx}")
+        
+        if current_idx == -1:
+            print("未找到当前音频组件，尝试查找第一个有效音频")
+            # 如果找不到当前音频，从头开始播放
+            for i, comp in enumerate(all_audio_components):
+                if comp is not None and isinstance(comp, tuple) and len(comp) == 2:
+                    current_idx = i - 1  # 设置为第一个有效音频的前一个位置
+                    break
+        
+        next_idx = current_idx + 1
+        print(f"当前音频索引: {current_idx}, 下一个索引: {next_idx}")
+        
+        # 检查是否有下一个有效的音频
+        while next_idx < len(all_audio_components):
+            next_audio = all_audio_components[next_idx]
+            if next_audio is not None and isinstance(next_audio, tuple) and len(next_audio) == 2:
+                print(f"找到下一个有效音频，索引: {next_idx}")
+                # 更新所有音频组件
+                updates = []
+                for i, comp in enumerate(all_audio_components):
+                    if i == next_idx:
+                        # 将下一个音频设置为自动播放
+                        updates.append(gr.update(visible=True, value=next_audio, autoplay=True))
+                    else:
+                        # 其他音频组件保持原样但不自动播放
+                        updates.append(gr.update(visible=True, value=comp if comp is not None else None, autoplay=False))
+                return updates
+            next_idx += 1
+        
+        print("没有找到下一个有效音频，保持当前状态")
+        # 如果没有下一个有效音频，保持所有组件当前状态
+        return [gr.update(visible=True, value=comp if comp is not None else None) for comp in all_audio_components]
+            
+    except Exception as e:
+        print(f"自动播放下一个音频时出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return [gr.update(visible=True)] * len(all_audio_components)
+
 with gr.Blocks() as demo:
     mutex = threading.Lock()
     state = gr.State([])
@@ -256,6 +313,14 @@ with gr.Blocks() as demo:
                     )
                     sentence_rows.append((row, text_box, audio_out, gen_btn))
 
+            # 为每个音频组件添加 stop 事件，实现自动播放下一条
+            for i, (_, _, audio_out, _) in enumerate(sentence_rows[:max_sentences]):
+                audio_out.stop(
+                    fn=continue_to_next_audio,
+                    inputs=[audio_out] + [comp[2] for comp in sentence_rows[:max_sentences]],  # 传入当前音频组件和所有音频组件
+                    outputs=[comp[2] for comp in sentence_rows[:max_sentences]]  # 更新所有音频组件
+                )
+
         def create_and_generate_all(text, prompt_audio):
             """分句并生成所有音频"""
             try:
@@ -273,18 +338,29 @@ with gr.Blocks() as demo:
                 print(f"处理 {len(sentences)} 个句子")
                 
                 updates = []
+                audio_paths = []  # 存储生成的音频路径
+                
                 # 更新组件可见性和内容，并生成音频
                 for i, sentence in enumerate(sentences):
                     row, text_box, audio_out, _ = sentence_rows[i]
                     # 生成音频
                     audio_path = generate_single_audio(prompt_audio, sentence)
-                    
-                    updates.extend([
-                        gr.update(visible=True),  # row
-                        gr.update(value=sentence, visible=True),  # text_box
-                        gr.update(value=audio_path, visible=True)  # audio_out
-                    ])
-                    print(f"生成句子 {i+1} 音频: {sentence}")
+                    if audio_path and os.path.exists(audio_path):
+                        audio_paths.append(audio_path)
+                        print(f"生成句子 {i+1} 音频: {audio_path}")
+                        
+                        updates.extend([
+                            gr.update(visible=True),  # row
+                            gr.update(value=sentence, visible=True),  # text_box
+                            gr.update(value=audio_path, visible=True)  # audio_out
+                        ])
+                    else:
+                        print(f"句子 {i+1} 音频生成失败")
+                        updates.extend([
+                            gr.update(visible=True),  # row
+                            gr.update(value=sentence, visible=True),  # text_box
+                            gr.update(visible=True)  # audio_out
+                        ])
                 
                 # 隐藏未使用的行
                 for i in range(len(sentences), max_sentences):
@@ -295,10 +371,10 @@ with gr.Blocks() as demo:
                         gr.update(visible=False)  # audio_out
                     ])
                 
-                # 更新合并按钮和输出框可见性
+                # 更新合并按钮和输出框的可见性（移除顺序播放行）
                 updates.extend([
                     gr.update(visible=True),  # output_box
-                    gr.update(visible=len(sentences) > 1)  # merge_row
+                    gr.update(visible=len(sentences) > 1),  # merge_row
                 ])
                 
                 return updates
@@ -307,7 +383,7 @@ with gr.Blocks() as demo:
                 print(f"生成音频时出错: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                return [gr.update(visible=False)] * (len(sentence_rows) * 3 + 2)
+                return [gr.update(visible=False)] * (len(sentence_rows) * 3 + 2)  # 减少一个更新
 
         # 修改分句按钮文本和事件绑定
         split_button.value = "一键生成"  # 更新按钮文本
@@ -318,7 +394,7 @@ with gr.Blocks() as demo:
             outputs=[
                 *[component for row in sentence_rows for component in row[:-1]],  # 所有行的组件（除了按钮）
                 output_box,
-                merge_row
+                merge_row,
             ]
         )
 
